@@ -1,8 +1,17 @@
 # Agent OS Research Papers
 
-A collection of research papers describing the Agent OS architecture and components.
+> Academic research supporting the Agent OS kernel architecture.
 
-## Paper Sequence
+## Quick Links
+
+| Document | Description | Status |
+|----------|-------------|--------|
+| [ASPLOS 2026 Submission](05-control-plane/) | Main kernel paper | arXiv Ready |
+| [RFC-001: IATP](../docs/rfcs/RFC-001-IATP.md) | Trust protocol spec | Draft |
+| [RFC-002: Agent VFS](../docs/rfcs/RFC-002-Agent-VFS.md) | Filesystem spec | Draft |
+| [Benchmarks](../docs/benchmarks/) | Reproducibility data | Complete |
+
+## Paper Portfolio
 
 The papers form a coherent research narrative, building from primitives to a complete kernel:
 
