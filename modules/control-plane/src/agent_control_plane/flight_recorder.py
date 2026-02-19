@@ -28,26 +28,51 @@ import logging
 
 
 class FlightRecorder:
-    """
-    The Black Box Recorder for AI Agents.
+    """The Black Box Recorder for AI Agents.
 
     Logs every action attempt with full context for forensic analysis.
     Similar to an aircraft's flight data recorder, this captures:
-    - Timestamp: When the action was attempted
-    - AgentID: Which agent attempted it
-    - InputPrompt: The original user/agent intent
-    - IntendedAction: What the agent tried to do
-    - PolicyVerdict: Whether it was allowed or blocked
-    - Result: What actually happened
-    
+
+    - **Timestamp**: When the action was attempted
+    - **AgentID**: Which agent attempted it
+    - **InputPrompt**: The original user/agent intent
+    - **IntendedAction**: What the agent tried to do
+    - **PolicyVerdict**: Whether it was allowed or blocked
+    - **Result**: What actually happened
+
     Performance features:
-    - WAL mode for better concurrent performance
-    - Batched writes (configurable batch_size and flush_interval)
-    - Connection reuse within threads
-    
+        - WAL mode for better concurrent performance
+        - Batched writes (configurable ``batch_size`` and ``flush_interval``)
+        - Connection reuse within threads via thread-local storage
+
     Security features:
-    - Merkle chain: Each entry includes hash of previous entry
-    - Tamper detection: verify_integrity() checks the hash chain
+        - Merkle chain: Each entry includes SHA-256 hash of previous entry
+        - Tamper detection: ``verify_integrity()`` checks the full hash chain
+
+    Example:
+        Basic recording workflow::
+
+            recorder = FlightRecorder(db_path="audit.db")
+
+            # Start a trace before executing a tool
+            trace_id = recorder.start_trace(
+                agent_id="agent-001",
+                tool_name="web_search",
+                tool_args={"query": "latest news"},
+                input_prompt="Find me today's headlines",
+            )
+
+            # Log the outcome
+            recorder.log_success(trace_id, result="Found 10 articles", execution_time_ms=152.3)
+
+            # Query the audit log
+            violations = recorder.query_logs(policy_verdict="blocked")
+
+            # Verify tamper-proof integrity
+            integrity = recorder.verify_integrity()
+            assert integrity["valid"]
+
+            recorder.close()
     """
 
     def __init__(
@@ -57,14 +82,27 @@ class FlightRecorder:
         flush_interval_seconds: float = 5.0,
         enable_batching: bool = True
     ):
-        """
-        Initialize the Flight Recorder.
+        """Initialize the Flight Recorder.
+
+        Sets up the SQLite database with WAL mode, creates the audit log
+        schema if it doesn't exist, and restores the Merkle hash chain
+        from the last recorded entry.
 
         Args:
-            db_path: Path to SQLite database file
-            batch_size: Number of operations to batch before commit (default 100)
-            flush_interval_seconds: Max seconds between flushes (default 5.0)
-            enable_batching: If False, commits immediately (legacy behavior)
+            db_path: Path to the SQLite database file. The file is created
+                if it does not exist. Defaults to ``"flight_recorder.db"``.
+            batch_size: Number of write operations to buffer before
+                committing to disk. Larger values improve throughput at the
+                cost of increased memory usage. Defaults to ``100``.
+            flush_interval_seconds: Maximum number of seconds between
+                automatic flushes, regardless of buffer size. Defaults to
+                ``5.0``.
+            enable_batching: When ``False``, every write is committed
+                immediately (legacy behaviour). Defaults to ``True``.
+
+        Raises:
+            sqlite3.OperationalError: If the database file cannot be opened
+                or the schema migration fails.
         """
         self.db_path = db_path
         self.logger = logging.getLogger("FlightRecorder")
@@ -230,17 +268,33 @@ class FlightRecorder:
         tool_args: Optional[Dict[str, Any]] = None,
         input_prompt: Optional[str] = None,
     ) -> str:
-        """
-        Start a new trace for an agent action.
+        """Start a new trace for an agent action.
+
+        Creates a pending audit log entry and links it into the Merkle
+        hash chain for tamper detection. The returned ``trace_id`` must be
+        passed to one of the outcome methods (``log_success``,
+        ``log_violation``, ``log_error``, ``log_shadow_exec``) to finalize
+        the entry.
 
         Args:
-            agent_id: ID of the agent
-            tool_name: Name of the tool being called
-            tool_args: Arguments passed to the tool
-            input_prompt: The original user/agent prompt (optional)
+            agent_id: Unique identifier of the agent performing the action.
+            tool_name: Name of the tool being called (e.g. ``"web_search"``).
+            tool_args: Keyword arguments passed to the tool. Serialized as
+                JSON in the audit log. Defaults to ``None``.
+            input_prompt: The original user or agent prompt that triggered
+                this tool call. Defaults to ``None``.
 
         Returns:
-            trace_id: Unique identifier for this trace
+            A UUID string uniquely identifying this trace. Use this value
+            with the ``log_*`` methods to record the outcome.
+
+        Example:
+            >>> trace_id = recorder.start_trace(
+            ...     agent_id="agent-001",
+            ...     tool_name="file_write",
+            ...     tool_args={"path": "/tmp/out.txt", "data": "hello"},
+            ... )
+            >>> recorder.log_success(trace_id, result="wrote 5 bytes")
         """
         trace_id = str(uuid.uuid4())
         timestamp = datetime.utcnow().isoformat()
@@ -264,12 +318,15 @@ class FlightRecorder:
         return trace_id
 
     def log_violation(self, trace_id: str, violation_reason: str):
-        """
-        Log a policy violation for a trace.
+        """Log a policy violation for a trace.
+
+        Updates the audit entry identified by ``trace_id`` to ``blocked``
+        status and records the reason. A warning is emitted to the logger.
 
         Args:
-            trace_id: The trace ID from start_trace
-            violation_reason: Why the action was blocked
+            trace_id: The trace ID returned by ``start_trace``.
+            violation_reason: Human-readable explanation of why the action
+                was blocked (e.g. ``"Tool 'rm_rf' not in allowed_tools"``).
         """
         self._queue_write(
             """
@@ -284,12 +341,17 @@ class FlightRecorder:
         self.logger.warning(f"BLOCKED: {trace_id} - {violation_reason}")
 
     def log_shadow_exec(self, trace_id: str, simulated_result: Optional[str] = None):
-        """
-        Log a shadow mode execution (simulated, not real).
+        """Log a shadow mode execution (simulated, not real).
+
+        Shadow mode allows the governance layer to return a plausible
+        simulated result to the agent without actually executing the tool.
+        This is useful for testing policy enforcement in production
+        without impacting real systems.
 
         Args:
-            trace_id: The trace ID from start_trace
-            simulated_result: The simulated result returned to the agent
+            trace_id: The trace ID returned by ``start_trace``.
+            simulated_result: The simulated result string returned to the
+                agent. Defaults to ``"Simulated success"`` when ``None``.
         """
         self._queue_write(
             """
@@ -306,13 +368,18 @@ class FlightRecorder:
     def log_success(
         self, trace_id: str, result: Optional[Any] = None, execution_time_ms: Optional[float] = None
     ):
-        """
-        Log a successful execution.
+        """Log a successful execution.
+
+        Updates the audit entry to ``allowed`` status and records the
+        result and timing information.
 
         Args:
-            trace_id: The trace ID from start_trace
-            result: The result of the execution
-            execution_time_ms: How long the execution took
+            trace_id: The trace ID returned by ``start_trace``.
+            result: The return value of the tool execution. Non-string
+                values are JSON-serialized before storage. Defaults to
+                ``None``.
+            execution_time_ms: Wall-clock execution time in milliseconds.
+                Defaults to ``None``.
         """
         result_str = (
             json.dumps(result)
@@ -334,12 +401,15 @@ class FlightRecorder:
         self.logger.info(f"ALLOWED: {trace_id}")
 
     def log_error(self, trace_id: str, error: str):
-        """
-        Log an execution error.
+        """Log an execution error.
+
+        Updates the audit entry to ``error`` status. Unlike violations,
+        errors indicate that the tool was *allowed* by policy but failed
+        during execution (e.g. network timeout, invalid arguments).
 
         Args:
-            trace_id: The trace ID from start_trace
-            error: The error message
+            trace_id: The trace ID returned by ``start_trace``.
+            error: Error message describing the failure.
         """
         self._queue_write(
             """
@@ -361,18 +431,38 @@ class FlightRecorder:
         end_time: Optional[datetime] = None,
         limit: int = 100,
     ) -> list:
-        """
-        Query the audit logs with filters.
+        """Query the audit logs with filters.
+
+        Opens a new read-only connection (safe for concurrent access under
+        WAL mode) and returns matching entries ordered by timestamp
+        descending.
 
         Args:
-            agent_id: Filter by agent ID
-            policy_verdict: Filter by verdict (allowed, blocked, shadow, error)
-            start_time: Filter by start timestamp
-            end_time: Filter by end timestamp
-            limit: Maximum number of results
+            agent_id: Filter by agent identifier. When ``None``, all
+                agents are included.
+            policy_verdict: Filter by verdict string. Valid values are
+                ``"allowed"``, ``"blocked"``, ``"shadow"``, ``"error"``,
+                and ``"pending"``. When ``None``, all verdicts are included.
+            start_time: Include only entries at or after this timestamp.
+            end_time: Include only entries at or before this timestamp.
+            limit: Maximum number of results to return. Defaults to ``100``.
 
         Returns:
-            List of audit log entries
+            A list of dictionaries, each representing one audit log entry
+            with keys: ``trace_id``, ``timestamp``, ``agent_id``,
+            ``tool_name``, ``tool_args``, ``input_prompt``,
+            ``policy_verdict``, ``violation_reason``, ``result``,
+            ``execution_time_ms``, ``metadata``, ``entry_hash``,
+            ``previous_hash``.
+
+        Example:
+            >>> blocked = recorder.query_logs(
+            ...     agent_id="agent-001",
+            ...     policy_verdict="blocked",
+            ...     limit=50,
+            ... )
+            >>> for entry in blocked:
+            ...     print(entry["violation_reason"])
         """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -408,11 +498,19 @@ class FlightRecorder:
         return results
 
     def get_statistics(self) -> Dict[str, Any]:
-        """
-        Get statistics about the audit log.
+        """Get aggregate statistics about the audit log.
 
         Returns:
-            Dictionary with statistics
+            A dictionary containing:
+
+            - ``total_actions`` (int): Total number of recorded actions.
+            - ``by_verdict`` (Dict[str, int]): Action counts grouped by
+              policy verdict (e.g. ``{"allowed": 42, "blocked": 3}``).
+            - ``top_agents`` (List[Dict]): Up to 10 most active agents,
+              each with ``agent_id`` and ``count`` keys.
+            - ``avg_execution_time_ms`` (Optional[float]): Mean execution
+              time across all successful actions, or ``None`` if no timing
+              data is available.
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -463,7 +561,7 @@ class FlightRecorder:
         }
 
     def close(self):
-        """Clean up resources - flush buffer and close connections"""
+        """Clean up resources by flushing the write buffer and closing connections."""
         self._flush_and_close()
     
     def flush(self):
@@ -473,15 +571,27 @@ class FlightRecorder:
     # ===== Tamper Detection =====
     
     def verify_integrity(self) -> Dict[str, Any]:
-        """
-        Verify the integrity of the audit log using Merkle chain.
-        
+        """Verify the integrity of the audit log using the Merkle hash chain.
+
+        Flushes any buffered writes, then walks the entire audit log in
+        insertion order verifying that each entry's ``previous_hash``
+        matches the ``entry_hash`` of its predecessor.
+
         Returns:
-            Dictionary with:
-            - valid: True if chain is intact
-            - total_entries: Number of entries checked
-            - first_tampered_id: ID of first tampered entry (if any)
-            - error: Error message (if any)
+            A dictionary with the following keys:
+
+            - ``valid`` (bool): ``True`` if the hash chain is intact.
+            - ``total_entries`` (int): Number of entries checked.
+            - ``message`` (str): Human-readable summary (when valid).
+            - ``first_tampered_id`` (int): Row ID of the first entry
+              where the chain breaks (only present when invalid).
+            - ``error`` (str): Description of the integrity failure
+              (only present when invalid).
+
+        Example:
+            >>> result = recorder.verify_integrity()
+            >>> if not result["valid"]:
+            ...     print(f"Tampered at entry {result['first_tampered_id']}")
         """
         self._flush_buffer()  # Ensure all writes are committed
         
@@ -536,11 +646,14 @@ class FlightRecorder:
     # ===== Time-Travel Debugging Support =====
     
     def get_log(self) -> list:
-        """
-        Get the complete audit log for time-travel debugging.
-        
+        """Get the complete audit log for time-travel debugging.
+
+        Returns all entries ordered by timestamp ascending, enabling
+        chronological replay of agent actions.
+
         Returns:
-            List of all audit log entries
+            A list of dictionaries representing every audit log entry,
+            ordered oldest-first.
         """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -564,16 +677,20 @@ class FlightRecorder:
         end_time: datetime,
         agent_id: Optional[str] = None
     ) -> list:
-        """
-        Get events within a specific time range for time-travel replay.
-        
+        """Get events within a specific time range for time-travel replay.
+
+        Useful for replaying agent behaviour during a specific incident
+        window or for generating compliance reports.
+
         Args:
-            start_time: Start of time range
-            end_time: End of time range
-            agent_id: Optional agent ID filter
-            
+            start_time: Inclusive start of the time range.
+            end_time: Inclusive end of the time range.
+            agent_id: When provided, only entries for this agent are
+                returned. Defaults to ``None`` (all agents).
+
         Returns:
-            List of audit log entries in the time range
+            A list of audit log entry dictionaries within the given time
+            range, ordered oldest-first.
         """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
